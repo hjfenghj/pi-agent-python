@@ -3,15 +3,8 @@
 from __future__ import annotations
 
 import json
-import sys
-import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Awaitable
-
-
-def _debug(msg: str):
-    """调试输出到 stderr，不干扰正常 stdout 输出。"""
-    print(f"[DEBUG] {msg}", file=sys.stderr)
 
 from src.agent.types import (
     AgentConfig,
@@ -79,8 +72,6 @@ class AgentLoop:
         history.append(Message(role=Role.USER, content=user_input))
 
         for turn in range(self.config.max_turns):
-            _debug(f"{'='*60}")
-            _debug(f"第 {turn + 1} 轮循环开始，当前历史消息数: {len(history)}")
             if on_event:
                 await on_event(AgentEvent(
                     kind="turn_start",
@@ -125,11 +116,6 @@ class AgentLoop:
 
             # 构建 assistant 消息
             assistant_msg = build_assistant_message(text_parts, tool_call_parts)
-            _debug(f"LLM 返回: content={'有' if assistant_msg.content else '无'}, "
-                   f"tool_calls={len(assistant_msg.tool_calls or [])}")
-            if assistant_msg.tool_calls:
-                for tc in assistant_msg.tool_calls:
-                    _debug(f"  → 工具调用: name={tc.name}, id={tc.id}, args={tc.arguments}")
             history.append(assistant_msg)
 
             if on_event:
@@ -143,7 +129,6 @@ class AgentLoop:
 
             # 没有工具调用 → 循环结束
             if not assistant_msg.tool_calls:
-                _debug("LLM 未请求工具，循环结束")
                 break
 
             # 执行工具调用
@@ -164,11 +149,6 @@ class AgentLoop:
         on_event: EventSink | None,
     ) -> ToolResult:
         """执行单个工具调用。"""
-        _debug(f"{'─'*60}")
-        _debug(f"工具调用开始: {tool_call.name}")
-        _debug(f"  调用 ID: {tool_call.id}")
-        _debug(f"  参数: {json.dumps(tool_call.arguments, ensure_ascii=False)}")
-
         if on_event:
             await on_event(AgentEvent(
                 kind="tool_start",
@@ -181,7 +161,6 @@ class AgentLoop:
 
         tool = self.tools.get(tool_call.name)
         if tool is None:
-            _debug(f"  ✗ 未知工具: {tool_call.name}")
             result = ToolResult(
                 tool_call_id=tool_call.id,
                 content=f"错误: 未知工具 '{tool_call.name}'",
@@ -189,18 +168,12 @@ class AgentLoop:
             )
         else:
             try:
-                t0 = time.time()
                 output = await tool.execute(**tool_call.arguments)
-                elapsed = time.time() - t0
-                preview = output[:200].replace('\n', '\\n')
-                _debug(f"  ✓ 执行完成 ({elapsed:.3f}s)")
-                _debug(f"  返回 {len(output)} 字符，预览: {preview}")
                 result = ToolResult(
                     tool_call_id=tool_call.id,
                     content=output,
                 )
             except Exception as e:
-                _debug(f"  ✗ 执行异常: {e}")
                 result = ToolResult(
                     tool_call_id=tool_call.id,
                     content=f"工具执行异常: {e}",
