@@ -27,6 +27,7 @@ from src.tools.find import FindTool
 from src.tools.grep import GrepTool
 from src.tools.read import ReadTool
 from src.tools.write import WriteTool
+from src.tools.current_time import CurrentTimeTool
 from src.prompt.system import build_system_prompt
 
 
@@ -69,6 +70,7 @@ class TUIApp:
         self.tools.register(BashTool(wd, timeout=self.config.bash_timeout))
         self.tools.register(GrepTool(wd))
         self.tools.register(FindTool(wd))
+        self.tools.register(CurrentTimeTool())
 
     # --- 主循环 ---
 

@@ -103,6 +103,7 @@ async def run_print_mode(config: AgentConfig, prompt: str):
     from src.tools.grep import GrepTool
     from src.tools.read import ReadTool
     from src.tools.write import WriteTool
+    from src.tools.current_time import CurrentTimeTool
     from src.prompt.system import build_system_prompt
 
     config.system_prompt = build_system_prompt(config.working_dir)
@@ -115,6 +116,7 @@ async def run_print_mode(config: AgentConfig, prompt: str):
     tools.register(BashTool(wd, timeout=config.bash_timeout))
     tools.register(GrepTool(wd))
     tools.register(FindTool(wd))
+    tools.register(CurrentTimeTool())
 
     client = LLMClient(config.api_key, config.base_url, config.model)
     loop = AgentLoop(config, client, tools)
