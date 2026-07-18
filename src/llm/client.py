@@ -259,6 +259,97 @@ class LLMClient:
                     yield {"type": "done", "finish_reason": finish}
                     return
 
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        temperature: float = 0.7,
+        system_prompt: str = "",
+    ) -> Message:
+        """非流式调用 chat/completions，一次性返回完整 Message。
+
+        与 stream_chat 的区别：
+            stream_chat：逐 token yield 事件，适合交互式 TUI（打字机效果）
+            chat：       等全部生成完，一次性返回完整消息，适合：
+                           - 后台批处理任务
+                           - 单元测试（结果确定，便于断言）
+                           - 简单脚本（一行命令拿结果）
+
+        响应格式差异（为什么 stream_chat 解析不了非流式响应）：
+            流式（SSE）:
+                data: {"choices":[{"delta":{"content":"你"}}]}
+                data: {"choices":[{"delta":{"content":"好"}}]}
+                data: [DONE]
+                ↑ 字段是 delta.content，逐行推送
+
+            非流式（单个 JSON）:
+                {
+                  "choices": [{
+                    "message": {"role":"assistant", "content":"你好"},
+                    "finish_reason": "stop"
+                  }]
+                }
+                ↑ 字段是 message.content，一次性返回
+
+        Args:
+            messages:      对话历史
+            tools:         可用工具列表
+            temperature:   创造性程度（0=严谨, 1=发散）
+            system_prompt: 系统提示词
+
+        Returns:
+            完整的 assistant Message（包含 content 和 tool_calls）
+        """
+        # 构建请求体（和 stream_chat 相同，只是 stream=False）
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [m.to_openai_dict() for m in messages],
+            "stream": False,  # ★ 关键区别：关闭流式
+            "temperature": temperature,
+        }
+        if system_prompt:
+            payload["messages"].insert(0, {"role": "system", "content": system_prompt})
+        if tools:
+            payload["tools"] = [t.to_openai_dict() for t in tools]
+            payload["tool_choice"] = "auto"
+
+        url = f"{self.base_url}/chat/completions"
+        response = await self._client.post(url, json=payload)
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"API 错误 {response.status_code}: {response.text}"
+            )
+
+        # 非流式响应是完整的 JSON，一次性解析
+        data = response.json()
+        choice = data["choices"][0]
+        msg = choice.get("message", {})
+
+        # 提取文本内容
+        content = msg.get("content")
+        if content:
+            content = content.strip() or None
+
+        # 提取工具调用（非流式模式下，参数是完整的 JSON 字符串，不需要拼装）
+        tool_calls: list[ToolCall] | None = None
+        if msg.get("tool_calls"):
+            tool_calls = []
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                args_str = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if args_str else {}
+                except json.JSONDecodeError:
+                    args = {"_raw": args_str}
+                tool_calls.append(ToolCall(
+                    id=tc.get("id", ""),
+                    name=fn.get("name", ""),
+                    arguments=args,
+                ))
+
+        return Message(role=Role.ASSISTANT, content=content, tool_calls=tool_calls)
+
     async def close(self):
         """关闭底层 HTTP 连接池，释放资源。"""
         await self._client.aclose()
