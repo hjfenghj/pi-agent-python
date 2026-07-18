@@ -476,3 +476,201 @@ LLM: 我需要调用 calendar 技能 → 加载完整技能内容 → 按技能�
 1. 定义 skill 格式（一个 `.md` 文件，包含 name、description、content）
 2. 启动时扫描技能目录，把技能列表注入系统提示词
 3. 添加 `skill` 工具，让 LLM 需要时自行加载技能详情
+
+---
+
+## Q10: 一个 event 是否可以理解为「类型 + 内容」？
+
+**是的**。一个 `AgentEvent` 就是「类型 + 内容」的组合。
+
+### 代码定义
+
+`loop.py:22-26`：
+
+```python
+@dataclass
+class AgentEvent:
+    kind: str                    # ← 类型：这是什么事件
+    data: dict[str, Any] = ...   # ← 内容：事件携带的具体数据
+```
+
+翻译成大白话：
+
+```
+AgentEvent = {
+    kind: "这是什么",    # 类型
+    data: {"具体内容"}  # 内容
+}
+```
+
+### 6 种事件的「类型 + 内容」
+
+| kind（类型） | data（内容） | 大白话 |
+|------|------|------|
+| `"turn_start"` | `{"turn": 1}` | "第 1 轮开始了" |
+| `"text_delta"` | `{"content": "你"}` | "LLM 输出了一个字：你" |
+| `"tool_start"` | `{"name": "read", "arguments": {...}}` | "开始调用 read 工具" |
+| `"tool_result"` | `{"name": "read", "content": "...", "is_error": false}` | "read 工具执行完了，结果是..." |
+| `"assistant_done"` | `{"content": "...", "has_tool_calls": false}` | "整条回复完成了" |
+| `"error"` | `{"message": "API 错误..."}` | "出错了" |
+
+### 类比理解
+
+```
+Event 就像一个「快递包裹」：
+
+  ┌─────────────┐
+  │  kind: 标签  │  ← 贴在箱子上：「这是文件」「这是食品」「这是电子产品」
+  │  data: 货物  │  ← 箱子里的具体东西
+  └─────────────┘
+```
+
+接收方（`on_event`）根据**标签**决定怎么处理：
+
+```python
+async def on_event(event: AgentEvent):
+    if event.kind == "text_delta":           # ← 看标签
+        print(event.data["content"])          # ← 取货物
+
+    elif event.kind == "tool_start":         # ← 看标签
+        print(Panel(event.data["name"]))      # ← 取货物
+
+    elif event.kind == "error":              # ← 看标签
+        print(f"错误: {event.data['message']}") # ← 取货物
+```
+
+### 为什么分成「类型 + 内容」两部分？
+
+**因为接收方需要不同的处理逻辑。**
+
+如果只有内容没有类型，接收方不知道该怎么处理：
+
+```python
+# ❌ 没有类型，怎么知道该打印还是报错？
+event = {"content": "你"}      # 这是文字？还是错误信息？
+event = {"name": "read"}       # 这是工具开始？还是工具结果？
+```
+
+加上类型就清晰了：
+
+```python
+# ✅ 有类型，处理逻辑明确
+AgentEvent(kind="text_delta",  data={"content": "你"})    # → 打印文字
+AgentEvent(kind="tool_start",  data={"name": "read"})    # → 显示工具面板
+AgentEvent(kind="error",       data={"message": "..."})  # → 显示错误
+```
+
+### 一句话总结
+
+```
+Event = 类型（kind）+ 内容（data）
+
+类型告诉接收方：「这是什么事件」
+内容告诉接收方：「具体发生了什么」
+```
+
+这就是为什么一个 `on_event` 函数能处理所有不同的事件——**通过 `kind` 分流，通过 `data` 取值**。
+
+---
+
+## Q11: LLM、Loop、on_event、execute 四个角色的职责怎么划分？
+
+### 核心结论
+
+```
+LLM        → 决定使用什么 tool（以及传什么参数）
+Loop       → 负责 tool 的编排（什么时候调、循环控制、结果回传）
+on_event   → 负责中转消息（通知外部"发生了什么"）
+execute    → 负责执行 tool（真正干活）
+```
+
+一句话归纳：**LLM 是决策者，Loop 是指挥官，on_event 是传令兵，execute 是干活的士兵。**
+
+### 四个角色各司其职
+
+| 角色 | 职责 | 代码位置 |
+|------|------|---------|
+| **LLM** | 决定调用哪个工具、传什么参数 | 返回 `tool_calls: [{name:"read", arguments:{...}}]` |
+| **Loop** | 编排：解析 tool_calls → 执行 → 结果加入 history | `loop.py:74-144` |
+| **on_event** | 中转：发出 `tool_start` / `tool_result` 通知 | `loop.py:152-192`（发通知）<br>`app.py:209-256`（收通知） |
+| **execute** | 执行：真正读文件/写文件/跑命令 | 各工具的 `execute()` 方法（如 `tools/read.py`） |
+
+### 关键澄清：工具执行不在 on_event 中
+
+`on_event` **只负责"广播"，不负责"执行"**。真正执行工具的是 Loop 自己。
+
+```python
+# loop.py 的 _execute_tool() 方法（精简）
+async def _execute_tool(self, tool_call, on_event):
+    # ① 通知："我要开始了"（on_event 只通知，不执行）
+    await on_event(tool_start)
+
+    # ② ★ 真正执行工具的是这里 ★
+    tool = self.tools.get(tool_call.name)             # Loop 取工具
+    output = await tool.execute(**tool_call.arguments) # Loop 调用 execute
+
+    # ③ 通知："我做完了"
+    await on_event(tool_result)
+
+    return result
+```
+
+### 完整调用链
+
+```
+用户: "读一下 main.py"
+   │
+   ▼
+Loop: 把消息发给 LLM
+   │
+   ▼
+LLM: 返回 tool_calls=[{name:"read", args:{file_path:"main.py"}}]
+   │   ↑ LLM 决定用什么工具
+   ▼
+Loop: 解析出 tool_calls，开始编排
+   │
+   ├→ on_event(tool_start, name="read")
+   │    ↓ on_event 中转消息
+   │  TUI 显示: "工具调用: read"
+   │
+   ├→ tool.execute(file_path="main.py")
+   │    ↓ execute 执行工具
+   │  ReadTool 读取文件内容
+   │
+   ├→ on_event(tool_result, content="文件内容...")
+   │    ↓ on_event 中转消息
+   │  TUI 显示: "结果: 文件内容..."
+   │
+   ▼
+Loop: 把结果加入 history，进入下一轮 LLM 调用
+```
+
+### 类比：餐厅运营
+
+```
+LLM（点菜的顾客）
+    "我要一份宫保鸡丁"
+        ↓
+Loop（厨师长 + 餐厅经理）
+    ① 接单
+    ② 自己去做菜（tool.execute）
+    ③ 通知服务员："开始做了" / "做完了"
+        ↓
+on_event（服务员）
+    ① 听到通知 → 告诉客人"开始做了" / "做完了"
+    ② ❌ 不会自己去做菜
+```
+
+### on_event 的扩展价值
+
+虽然在本项目中 `on_event` 只做显示（打印），但它的本质是一个**通用扩展点（hook）**。在生产级 Agent 中，同一个钩子可以承载：
+
+| 用途 | 本项目 | 生产级 Agent |
+|------|-------|-------------|
+| 显示 | ✅ console.print | ✅ 更复杂的渲染 |
+| 审计日志 | ❌ | ✅ 每次 tool_call 记录 |
+| 权限审批 | ❌ | ✅ 危险操作拦截 |
+| 计费统计 | ❌ | ✅ token 计数 |
+| 性能监控 | ❌ | ✅ 延迟/成功率上报 |
+
+Loop 一行代码都不用改，只需要写一个新的 `on_event` 实现——这就是观察者模式的威力。
