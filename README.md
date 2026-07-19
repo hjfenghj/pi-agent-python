@@ -67,6 +67,7 @@ python examples/chat_once.py "1+1=?"
 | `/tools` | 列出已注册工具 |
 | `/history` | 显示当前会话消息历史 |
 | `/sessions` | 列出所有会话 |
+| `/resume` | 选择并恢复历史会话（交互式选择） |
 | `/clear` | 清空当前会话 |
 | `/quit` | 退出 |
 

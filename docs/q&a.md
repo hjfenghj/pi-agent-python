@@ -674,3 +674,291 @@ on_event（服务员）
 | 性能监控 | ❌ | ✅ 延迟/成功率上报 |
 
 Loop 一行代码都不用改，只需要写一个新的 `on_event` 实现——这就是观察者模式的威力。
+
+---
+
+## Q12: 每轮 prompt 输入时，传给 LLM 的是完整 history 吗？所有 Agent 都这样吗？
+
+### 核心结论
+
+**本项目（以及大多数主流 Agent）每轮都把完整对话历史发给 LLM**，因为 LLM 本身是无状态的——它的"记忆"完全来自你传的 history。
+
+### 代码验证
+
+`loop.py:87-89` 每次调用 LLM 都传完整 history：
+
+```python
+async for event in self.client.stream_chat(
+    history,    # ← ★ 完整历史，包含所有之前的对话
+    tool_defs,
+    system_prompt=self.config.system_prompt,
+):
+```
+
+而 `history` 在循环中**不断增长**：
+
+```python
+# loop.py:72 - 用户消息加入
+history.append(Message(role=Role.USER, content=user_input))
+
+# loop.py:119 - assistant 回复加入
+history.append(assistant_msg)
+
+# loop.py:137-142 - 工具结果加入
+history.append(Message(role=Role.TOOL, content=result.content, ...))
+```
+
+### 具体例子
+
+假设连续问了两个问题：
+
+```
+第 1 轮: "读一下 main.py"
+第 2 轮: "这个文件有多少行？"
+```
+
+**第 1 轮调用 LLM 时**，history 包含：
+
+```python
+[
+    {"role": "user", "content": "读一下 main.py"},
+]
+```
+
+**第 2 轮调用 LLM 时**，history 包含：
+
+```python
+[
+    {"role": "user", "content": "读一下 main.py"},                    # 第1轮用户问题
+    {"role": "assistant", "tool_calls": [{name:"read", ...}]},        # 第1轮 LLM 请求工具
+    {"role": "tool", "content": "文件: main.py (173 行)..."},         # 第1轮工具结果
+    {"role": "assistant", "content": "main.py 共 173 行"},            # 第1轮 LLM 最终回复
+    {"role": "user", "content": "这个文件有多少行？"},                 # 第2轮用户问题
+]
+```
+
+**LLM 能回答"这个文件有多少行？"正是因为 history 里有上一轮的工具结果（173 行）**。
+
+### LLM 是"无状态"的
+
+```
+❌ 错误印象: LLM 记得你说过什么
+✅ 实际情况: LLM 每次都是"从零开始"，全靠你传的 history
+```
+
+```
+每次 API 调用:
+    你 ──── history（完整对话）────→ LLM
+    你 ←──── 回复 ──────────────── LLM
+
+LLM 自己不保存任何上下文，
+它"记忆"的唯一来源就是你传的 history。
+```
+
+### 数据流图
+
+```
+app.py                        loop.py                      client.py            LLM 服务器
+──────                        ──────                       ──────────           ─────────
+用户输入: "这个文件多少行？"
+    │
+    ├→ self.session.messages  ──→ history.append(user_msg)
+    │   (之前的历史)                │
+    │                              ▼
+    │                       stream_chat(history, ...)  ──→ POST /chat/completions
+    │                                                       body: {
+    │                                                         messages: [
+    │                                                           完整 history
+    │                                                         ]
+    │                                                       }
+    │                                                              │
+    │                                                              ▼
+    │                                                       LLM 基于完整历史生成回复
+    │                                                              │
+    │                              ←───────────────────────── 流式返回
+```
+
+### Token 消耗问题
+
+每轮都在重复发送之前所有内容，token 消耗是累加的：
+
+```
+第 1 轮: 发送    10 tokens  (用户问题)
+第 2 轮: 发送   500 tokens  (第1轮全部 + 新问题)
+第 3 轮: 发送 1,500 tokens  (前两轮全部 + 新问题)
+第 4 轮: 发送 3,000 tokens  (前三轮全部 + 新问题)
+...
+```
+
+| 问题 | 原因 | 解决方案 |
+|------|------|---------|
+| **费用递增** | 每轮发的内容越来越多 | 压缩历史（compaction） |
+| **超出上下文窗口** | history 超过模型上限（如 128K） | 摘要 + 裁剪旧消息 |
+
+### 所有 Agent 都这样吗？
+
+不是所有，但**主流通用 Agent 都是这样**。也有替代方案：
+
+| 方案 | 传给 LLM 的内容 | 代表产品 | 适用场景 |
+|------|----------------|---------|---------|
+| **完整历史** | 所有历史消息 | ChatGPT、Claude、本项目 | 通用对话、编程助手 |
+| **摘要 + 最近** | 压缩后的摘要 + 近期消息 | Claude Code（compaction）、MemGPT | 超长对话 |
+| **RAG 检索** | 当前问题 + 检索到的相关片段 | 文档问答、知识库 | 海量历史 |
+| **状态机** | 只带当前步骤的上下文 | Dify、客服机器人 | 固定流程任务 |
+
+随着模型上下文窗口越来越大（GPT-4: 128K，Claude: 200K，Gemini: 1M），"完整历史"的代价越来越小，主流 Agent 仍然倾向这种方案。
+
+### 本项目的扩展空间
+
+`app.py:151-152` 已经预留了压缩功能的入口：
+
+```python
+elif cmd in ("compact", "c"):
+    self.console.print("[dim]压缩功能待实现（需要 LLM 生成摘要）[/dim]")
+```
+
+未来可以实现：把旧历史用 LLM 压缩成摘要，只保留摘要 + 最近几条消息。
+
+### 一句话总结
+
+```
+"每轮发完整历史" 是当前主流 Agent 的默认做法，
+因为 LLM 是无状态的，必须靠 history 传递上下文。
+
+但也有替代方案（摘要、RAG、状态机），
+用于解决 token 成本和上下文窗口的限制。
+```
+
+这也解释了为什么本项目有 `/clear` 命令——清空 history 后，LLM 就"忘记"了之前的一切（因为没东西传给它了）。
+
+---
+
+## Q13: `/resume` 恢复会话后，再问问题是带选中会话的历史，还是全部会话的历史？
+
+### 核心结论
+
+**只带选中会话的历史**，其他会话完全不参与。行为和 Claude Code 的 `/resume` 一致。
+
+### 原理：Session 隔离
+
+每个 Session 是独立的"对话场景"，互不干扰：
+
+```
+Session A (aaa): [Q1, A1, Q2, A2]    ← 讨论编程
+Session B (bbb): [Q3, A3]            ← 讨论翻译
+Session C (ccc): [Q5, A5]            ← 当前所在，讨论写作
+
+执行 /resume, 选择 Session A:
+    self.session.messages = [Q1, A1, Q2, A2]    ← 整个数组被替换
+    self.session.session_id = "aaa"
+
+用户问: "刚才说的那个 bug 是什么？"
+    → Loop 只发送 [Q1, A1, Q2, A2, 新问题] 给 LLM
+    → B 和 C 的历史完全不带上
+```
+
+### 代码验证
+
+`_resume_session()` 中的核心切换逻辑（`app.py:243`）：
+
+```python
+# ★ 用 session_id 加载历史会话
+# Session.__init__ 会自动调用 _load() 从 JSONL 文件恢复所有消息
+self.session = Session(session_id=selected["id"])
+```
+
+后续 `_handle_chat()` 只传 `self.session.messages`（`app.py:266-270`）：
+
+```python
+await self.loop.run(
+    user_input,
+    self.session.messages,   # ← ★ 只传当前会话的 messages
+    on_event=on_event,
+)
+```
+
+`/resume` 之后，`self.session.messages` **只包含选中会话的消息**——其他会话的内容在内存里根本不存在。
+
+### 恢复的完整调用链
+
+```
+/resume 1
+   ↓
+_resume_session()
+   ↓
+self.session = Session(session_id="a1b2c3d4e5f6")    ← 指定 ID
+   ↓
+Session.__init__ 自动调用 _load()                      ← session.py:27
+   ↓
+_load() 读取 ~/.pi-agent-python/sessions/a1b2c3d4e5f6.jsonl
+   ↓
+逐行解析 JSON，重建 Message 对象                        ← session.py:29-45
+   ↓
+self.session.messages = [该会话的所有历史消息]          ← 恢复完成
+```
+
+### 与 Claude Code `/resume` 的对比
+
+能力已对齐：
+
+| 能力 | 本项目 `/resume` | Claude Code `/resume` |
+|------|-----------------|----------------------|
+| 列出会话 | ✅ | ✅ |
+| 选择恢复 | ✅ 数字选择 | ✅ 上下箭头 |
+| 切换上下文 | ✅ 只带选中会话 | ✅ 只带选中会话 |
+| 其他会话历史 | ❌ 不发送 | ❌ 不发送 |
+| 切换前当前会话 | ✅ 已自动保存 | ✅ 已自动保存 |
+| 切换后再问问题 | ✅ 延续选中会话 | ✅ 延续选中会话 |
+
+### 完整时序图
+
+```
+时刻 1: 在 Session C 中对话
+    self.session.messages = [Q5, A5]
+    self.session.session_id = "ccc"
+
+    > "继续讨论刚才的文章"
+    → Loop 发送 [Q5, A5, "继续讨论刚才的文章"] 给 LLM
+    → LLM 基于会话 C 的上下文回答
+
+时刻 2: 执行 /resume, 选择 Session A
+    self.session = Session(session_id="aaa")
+    self.session.messages = [Q1, A1, Q2, A2]   ← 整个被替换
+    self.session.session_id = "aaa"
+
+    > "刚才说的那个 bug 是什么？"
+    → Loop 发送 [Q1, A1, Q2, A2, "刚才说的那个 bug"] 给 LLM
+    → LLM 基于会话 A 的上下文回答（知道"那个 bug"指 A 里讨论的）
+    → C 的 [Q5, A5] 完全不参与
+
+时刻 3: 新的回复会自动追加到 Session A 的 JSONL
+    Session A 的 messages: [Q1, A1, Q2, A2, Q6, A6]
+    Session A 的 JSONL 文件: ~/.pi-agent-python/sessions/aaa.jsonl ← 自动追加
+```
+
+### 关键设计：Loop 不需要重建
+
+切换 Session 时只换 `self.session`，不需要重建 `self.loop`：
+
+```python
+# 不需要这样做（冗余）
+self.session = Session(session_id=selected["id"])
+self.loop = AgentLoop(self.config, self.client, self.tools)  # ← 多余
+
+# 只需要这样做（正确）
+self.session = Session(session_id=selected["id"])
+```
+
+原因：`AgentLoop` 只依赖 `config`、`client`、`tools`，这三者与会话无关。会话历史在 `run()` 被调用时才作为参数传入。
+
+### 一句话总结
+
+```
+✅ 选择 session_id 后，恢复的就是该会话的 history
+✅ 之后问问题只带该会话的历史，其他会话完全不参与
+✅ 行为和 Claude Code 的 /resume 一致
+
+本质: self.session.messages 是 Loop 的唯一上下文来源
+      /resume 把这个数组替换成选中会话的历史
+      Loop 之后每次调用 LLM 都基于这个新数组
+```

@@ -79,14 +79,15 @@ class TUIApp:
         self._print_banner()
         self._print_help()
 
-        pt_session = PtPromptSession(
+        # 这个地方在每次重启agent的时候，会加载之前的所有历史会话sessions，然后通过上下箭头可以选择恢复历史prompt
+        self.pt_session = PtPromptSession(
             history=FileHistory(self._history_file),
         )
 
         while self._running:
             try:
                 # 获取用户输入
-                user_input = await pt_session.prompt_async(
+                user_input = await self.pt_session.prompt_async(
                     [("bold cyan", "> ")],
                     multiline=False,
                 )
@@ -139,6 +140,9 @@ class TUIApp:
         elif cmd == "sessions":
             self._show_sessions()
 
+        elif cmd == "resume":
+            await self._resume_session()
+
         elif cmd == "tools":
             self._show_tools()
 
@@ -169,6 +173,78 @@ class TUIApp:
                 f"({s['messages']} 条消息) "
                 f"{s['preview']}{current}"
             )
+
+    async def _resume_session(self):
+        """交互式选择并恢复历史会话。
+
+        流程:
+            1. 列出所有历史会话（带编号）
+            2. 用户输入编号选择
+            3. 用 Session(session_id=...) 加载该会话历史
+            4. 切换 self.session 到目标会话
+
+        设计说明:
+            - Session 类的 __init__ 已支持通过 session_id 加载历史（_load 方法）
+            - 这里只做"用户交互层"，底层能力已具备
+            - 当前会话的消息会自动保存在它自己的 JSONL 文件，切换不会丢失
+            - self.loop 不需要重建（它只依赖 client 和 tools，与会话无关）
+        """
+        sessions = Session.list_sessions()
+        if not sessions:
+            self.console.print("[dim]暂无历史会话[/dim]")
+            return
+
+        # 最多显示 10 个会话
+        candidates = sessions[:10]
+        self.console.print("[bold]历史会话:[/bold]")
+        for i, s in enumerate(candidates, start=1):
+            current = " ← 当前" if s["id"] == self.session.session_id else ""
+            self.console.print(
+                f"  [{COLOR_INFO}]{i}[/{COLOR_INFO}] "
+                f"[{COLOR_INFO}]{s['id']}[/{COLOR_INFO}] "
+                f"({s['messages']} 条消息) "
+                f"{s['preview']}{current}"
+            )
+        self.console.print(f"  [{COLOR_INFO}]0[/{COLOR_INFO}] 取消")
+        self.console.print()
+
+        # 用 prompt_toolkit 同步获取用户选择
+        try:
+            choice = await self.pt_session.prompt_async(
+                [("bold", "请选择会话编号: ")],
+            )
+            choice = choice.strip()
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[dim]已取消[/dim]")
+            return
+
+        # 校验输入
+        if not choice or choice == "0":
+            self.console.print("[dim]已取消[/dim]")
+            return
+
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            self.console.print(f"[{COLOR_ERROR}]请输入有效编号[/{COLOR_ERROR}]")
+            return
+
+        if idx < 0 or idx >= len(candidates):
+            self.console.print(f"[{COLOR_ERROR}]编号超出范围[/{COLOR_ERROR}]")
+            return
+
+        selected = candidates[idx]
+        if selected["id"] == self.session.session_id:
+            self.console.print("[dim]已经是当前会话[/dim]")
+            return
+
+        # ★ 核心：用 session_id 加载历史会话
+        # Session.__init__ 会自动调用 _load() 从 JSONL 文件恢复所有消息
+        self.session = Session(session_id=selected["id"])
+        self.console.print(
+            f"[{COLOR_INFO}]已恢复会话: {selected['id']} "
+            f"({len(self.session.messages)} 条消息)[/{COLOR_INFO}]"
+        )
 
     def _show_tools(self):
         """列出已注册工具。"""
@@ -206,6 +282,7 @@ class TUIApp:
         # 收集 Agent 响应
         full_text = ""
 
+        # on_event是被Loop拉着走，属于响应者
         async def on_event(event: AgentEvent):
             nonlocal full_text
 
@@ -260,6 +337,7 @@ class TUIApp:
         prev_len = len(self.session.messages)
 
         try:
+            # 执行者
             updated_history = await self.loop.run(
                 user_input,
                 self.session.messages,
@@ -303,6 +381,7 @@ class TUIApp:
             ("/tools", "列出工具"),
             ("/history", "显示当前会话历史"),
             ("/sessions", "列出所有会话"),
+            ("/resume", "选择并恢复历史会话"),
             ("/clear", "清空当前会话"),
             ("/quit", "退出"),
         ]

@@ -84,6 +84,7 @@ class AgentLoop:
             tool_call_parts: dict[int, dict[str, Any]] = {}
 
             try:
+                # client发送请求以后，能返回多少事件这个是怎么决定的？
                 async for event in self.client.stream_chat(
                     history, tool_defs, system_prompt=self.config.system_prompt,
                 ):
