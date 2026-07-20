@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.syntax import Syntax
 
+from src.agent.compact import compact_history, CompactStats
 from src.agent.loop import AgentLoop, AgentEvent
 from src.agent.session import Session
 from src.agent.types import AgentConfig, Message, Role
@@ -153,7 +154,7 @@ class TUIApp:
             self.console.print(f"[dim]当前会话已保存: {self.session.session_id}[/dim]")
 
         elif cmd in ("compact", "c"):
-            self.console.print("[dim]压缩功能待实现（需要 LLM 生成摘要）[/dim]")
+            await self._handle_compact(args)
 
         else:
             self.console.print(f"[red]未知命令: /{cmd}[/red]")
@@ -272,6 +273,67 @@ class TUIApp:
                 preview = (msg.content or "")[:100]
                 self.console.print(f"  [{COLOR_TOOL}]{msg.name}[/{COLOR_TOOL}]: {preview}...")
 
+    async def _handle_compact(self, args: str):
+        """处理 /compact 命令：压缩当前会话历史。
+
+        流程：
+            1. 调用 compact_history 生成摘要并截断
+            2. 持久化：clear + append_batch（保留 session_id，重建 JSONL 文件）
+            3. 输出压缩前后统计信息
+
+        Args:
+            args: /compact 后的可选聚焦指令（如 "/compact 重点保留代码相关讨论"）
+        """
+        if len(self.session.messages) < 4:
+            self.console.print(
+                f"[{COLOR_INFO}]消息太少（{len(self.session.messages)} 条），无需压缩[/{COLOR_INFO}]"
+            )
+            return
+
+        custom = args.strip() or None
+        total_tokens_hint = sum(
+            len(m.content or "") for m in self.session.messages
+        ) // 4  # 粗略提示用
+
+        self.console.print(
+            f"[{COLOR_INFO}]开始压缩 {len(self.session.messages)} 条消息"
+            f"（约 {total_tokens_hint} tokens）...[/{COLOR_INFO}]"
+        )
+        if custom:
+            self.console.print(f"[dim]聚焦指令: {custom}[/dim]")
+
+        try:
+            new_messages, stats = await compact_history(
+                messages=self.session.messages,
+                client=self.client,
+                custom_instructions=custom,
+            )
+        except ValueError as e:
+            # 无可压缩内容等业务异常
+            self.console.print(f"[{COLOR_INFO}]{e}[/{COLOR_INFO}]")
+            return
+        except RuntimeError as e:
+            self.console.print(f"[{COLOR_ERROR}]压缩失败: {e}[/{COLOR_ERROR}]")
+            return
+
+        # 持久化：clear 会删除 JSONL 文件，然后 append_batch 重新写入
+        # session_id 保持不变，相当于在该 session 内"重写"历史
+        self.session.clear()
+        self.session.append_batch(new_messages)
+
+        # 友好的统计展示
+        reduction = 0
+        if stats.tokens_before > 0:
+            reduction = (1 - stats.tokens_after / stats.tokens_before) * 100
+
+        self.console.print(
+            f"[{COLOR_ASSISTANT}]压缩完成[/{COLOR_ASSISTANT}] "
+            f"摘要 {stats.summarized_count} 条 → 1 条摘要消息，"
+            f"保留最近 {stats.kept_count} 条 | "
+            f"tokens: {stats.tokens_before} → {stats.tokens_after} "
+            f"(↓ {reduction:.1f}%)"
+        )
+
     # --- 对话处理 ---
 
     async def _handle_chat(self, user_input: str):
@@ -382,6 +444,7 @@ class TUIApp:
             ("/history", "显示当前会话历史"),
             ("/sessions", "列出所有会话"),
             ("/resume", "选择并恢复历史会话"),
+            ("/compact [聚焦]", "压缩当前会话历史"),
             ("/clear", "清空当前会话"),
             ("/quit", "退出"),
         ]

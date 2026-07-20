@@ -962,3 +962,101 @@ self.session = Session(session_id=selected["id"])
       /resume 把这个数组替换成选中会话的历史
       Loop 之后每次调用 LLM 都基于这个新数组
 ```
+
+---
+
+## Q14: 为什么 `estimate_tokens` 用 chars/4 估算 token？
+
+`src/agent/compact.py` 里有一个 `estimate_tokens()` 函数，用 `chars / 4` 估算消息的 token 数。两个常见疑问：
+
+1. **为什么不直接用真实 tokenizer？**
+2. **为什么是 4 个字符一个 token？**
+
+### 为什么需要 `estimate_tokens`？
+
+压缩流程需要在**事前**做两个决策：
+
+| 决策点 | 用途 | 时机 |
+|---|---|---|
+| `find_cut_point()` | 决定从末尾保留几条消息 | **压缩前** |
+| `CompactStats` | 给用户显示"3232 → 2033 tokens" | 压缩后 |
+
+三种可选方案的对比：
+
+| 方案 | 精度 | 硬伤 |
+|---|---|---|
+| 真实 tokenizer（`tiktoken`） | 高 | ① 每家模型 tokenizer 不同（OpenAI/Claude/GLM/Gemini 各一套），`tiktoken` 只对 OpenAI 系列准；② 多 ~60MB 词表依赖；③ `encode()` 比 `len()` 慢几个数量级 |
+| API 返回的 `usage` 字段 | 最高 | **只能事后知道**——压缩是事前决策（要不要压、压到哪），`usage` 还没产生 |
+| `chars/4` 启发式 | 低 | 不精确，但对二元决策够用 |
+
+**关键洞察**：`estimate_tokens` 在压缩里只用于两个地方——决定保留几条消息（二元决策，±30% 误差无致命影响）和给用户看统计数字（不需要精确到个位）。真正决定压缩质量的是 LLM 摘要能力，不是计数精度。
+
+### 4 chars/token 的来源
+
+这是 **OpenAI 官方经验法则**，在 cookbook 和文档里多次给出：
+
+> 英文：1 token ≈ 4 个字符（含空格）
+
+源于 GPT 的 BPE（Byte-Pair Encoding）分词统计：
+
+```
+"hamburger"   9 chars → ["ham", "burger"]      = 2 tokens   比例 4.5
+"viscosity"   9 chars → ["vis", "cosity"]      = 2 tokens   比例 4.5
+"the"         3 chars → ["the"]                = 1 token    比例 3.0
+"anti"        4 chars → ["anti"]               = 1 token    比例 4.0
+"Hello, world!" 13 chars → 4 tokens                          比例 ~3.3
+```
+
+### 不同语言的差异
+
+`chars/4` 是英文统计值，其他语言差异很大：
+
+| 语言 | 实际比例 | 与 chars/4 的偏差 |
+|---|---|---|
+| 英文 | ~4 chars/token | 基本吻合 |
+| 代码 | ~3 chars/token | 略低估 |
+| 中文 | **~1.5-2 chars/token** | **高估 1-2 倍** |
+| Emoji | 1 emoji = 3-5 tokens | 严重低估 |
+
+中文偏高的原因：BPE 词表英文优先，汉字常被切成多个 token。例如"你好"在 GPT-4 的 tokenizer 里可能是 `["你", "好"]` = 2 tokens（2 chars / 2 = 1 char/token），用 chars/4 估算却只算 0.5 token。
+
+### 为什么偏保守没问题？
+
+原版 pi 在 `compaction.ts:256` 注释明确写着：
+> "This is conservative (overestimates tokens)."
+
+保守（高估）对压缩触发判断有利：
+
+```
+实际 80k，估算 100k → 提前压缩   → 后果：历史被多压一点   （可接受）
+实际 80k，估算 60k  → 延迟压缩   → 后果：超窗口 API 报错 （不可接受）
+```
+
+偏保守 ≠ 越保守越好，但**正向偏差**对系统稳定性是安全的。
+
+### 中文场景的实际影响
+
+- `find_cut_point` 用同一把尺子衡量所有消息，**相对比例仍然成立**——该截到哪里还是截到哪里
+- `CompactStats` 显示的 tokens before/after 偏高，但减少的百分比仍然有意义
+- 不影响压缩本身的正确性，只影响数字观感
+
+### 如果想更精确
+
+两条路径（YAGNI，未实现）：
+
+1. **混合策略**（原版 pi 的做法）：让 `LLMClient` 解析 API 返回的 `usage` 字段，写回每条 assistant 消息的 metadata。压缩时用真实历史 `usage` + 仅对最新未发送消息用 chars/4 估算（见 `compaction.ts:192-220` 的 `estimateContextTokens()`）
+2. **引入 `tiktoken`**：仅对 OpenAI 系列精确，其他模型回退到 chars/4
+
+### 一句话总结
+
+```
+为什么需要 estimate_tokens？
+  因为压缩是事前决策，usage 还没产生，必须本地估算。
+
+为什么是 chars/4？
+  OpenAI 英文场景的 BPE 分词经验值（GPT-3 时代流传至今）。
+
+为什么偏保守也没问题？
+  estimate_tokens 只用于"保留几条消息"这种二元决策，
+  ±30% 误差无致命影响；真正决定压缩质量的是 LLM 摘要能力。
+```
