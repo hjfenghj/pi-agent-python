@@ -316,10 +316,8 @@ class TUIApp:
             self.console.print(f"[{COLOR_ERROR}]压缩失败: {e}[/{COLOR_ERROR}]")
             return
 
-        # 持久化：clear 会删除 JSONL 文件，然后 append_batch 重新写入
-        # session_id 保持不变，相当于在该 session 内"重写"历史
-        self.session.clear()
-        self.session.append_batch(new_messages)
+        # 持久化：用 rewrite 整体替换 JSONL 文件（session_id 保持不变）
+        self.session.rewrite(new_messages)
 
         # 友好的统计展示
         reduction = 0
@@ -343,6 +341,9 @@ class TUIApp:
 
         # 收集 Agent 响应
         full_text = ""
+        # ★ 自动压缩标记：用 list 包装以便闭包内修改
+        # 发生过自动压缩时，需要 rewrite 整个 session 文件（而非增量 append）
+        was_compacted = [False]
 
         # on_event是被Loop拉着走，属于响应者
         async def on_event(event: AgentEvent):
@@ -390,6 +391,34 @@ class TUIApp:
                 if event.data.get("content") and not event.data.get("has_tool_calls"):
                     self.console.print()  # 最终换行
 
+            elif event.kind == "auto_compact_start":
+                # ★ 自动压缩开始：标记 + 显示进度
+                was_compacted[0] = True
+                self.console.print(Panel(
+                    Text(
+                        f"上下文 {event.data['tokens_before']} tokens 超过阈值 "
+                        f"{event.data['threshold']}，开始自动压缩 "
+                        f"({event.data['message_count']} 条消息)...",
+                        style=COLOR_INFO,
+                    ),
+                    border_style=COLOR_INFO,
+                    title="自动压缩",
+                    title_align="left",
+                    expand=False,
+                ))
+
+            elif event.kind == "auto_compact_done":
+                # ★ 自动压缩完成：显示统计
+                before = event.data["tokens_before"]
+                after = event.data["tokens_after"]
+                reduction = (1 - after / before) * 100 if before > 0 else 0
+                self.console.print(
+                    f"[{COLOR_ASSISTANT}]✓ 压缩完成: "
+                    f"摘要 {event.data['summarized_count']} 条 → 1 条, "
+                    f"保留 {event.data['kept_count']} 条 | "
+                    f"tokens: {before} → {after} (↓ {reduction:.1f}%)[/{COLOR_ASSISTANT}]"
+                )
+
             elif event.kind == "error":
                 self.console.print()
                 self.console.print(f"[{COLOR_ERROR}]错误: {event.data['message']}[/{COLOR_ERROR}]")
@@ -406,9 +435,17 @@ class TUIApp:
                 on_event=on_event,
             )
 
-            # 持久化新增的消息
-            new_msgs = updated_history[prev_len:]
-            self.session.append_batch(new_msgs)
+            # 持久化策略：
+            # - 发生过自动压缩：history 被 in-place 重写，prev_len 已失效，
+            #   需要用 rewrite 整体重写 JSONL
+            # - 未发生压缩：仅追加新增消息（增量 append，性能更好）
+            if was_compacted[0]:
+                # 先 snapshot，因为 updated_history 就是 self.session.messages 的引用
+                snapshot = list(updated_history)
+                self.session.rewrite(snapshot)
+            else:
+                new_msgs = updated_history[prev_len:]
+                self.session.append_batch(new_msgs)
 
         except Exception as e:
             self.console.print(f"\n[{COLOR_ERROR}]执行错误: {e}[/{COLOR_ERROR}]")

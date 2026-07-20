@@ -112,6 +112,26 @@ class Session:
                 entry = self._message_to_entry(msg)
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def rewrite(self, msgs: list[Message]):
+        """用新的消息列表完全替换当前会话内容。
+
+        用于自动压缩 / 手动压缩后整体替换历史。
+
+        实现：先 snapshot 输入（避免 msgs 引用 self.messages 导致 clear 后空），
+        再清空 list + 用 'w' 模式整体重写文件。
+
+        与 clear() + append_batch() 的区别：
+            - clear+append_batch：删除文件 → 重新创建 → 追加（2 次文件操作）
+            - rewrite：直接 'w' 模式覆盖（1 次文件操作，原子性更好）
+        """
+        snapshot = list(msgs)  # 防御性复制
+        self.messages.clear()
+        self.messages.extend(snapshot)
+        with self.file_path.open("w", encoding="utf-8") as f:
+            for msg in snapshot:
+                entry = self._message_to_entry(msg)
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def clear(self):
         """清空会话。"""
         self.messages.clear()

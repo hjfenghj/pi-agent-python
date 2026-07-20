@@ -118,3 +118,8 @@ class AgentConfig:
     max_tool_output: int = 30000
     bash_timeout: int = 120
     working_dir: str = "."
+    # 上下文管理（自动压缩）
+    context_window: int = 128000              # 模型上下文窗口（tokens），用于自动压缩触发判断
+    auto_compact: bool = True                 # 是否启用自动压缩
+    compact_reserve_tokens: int = 16384       # 触发阈值 = context_window - 此值
+    compact_keep_recent_tokens: int = 20000   # 自动压缩时保留末尾 tokens（与手动 /compact 共用）

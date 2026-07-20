@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Awaitable
 
+from src.agent.compact import compact_history, estimate_total_tokens
 from src.agent.types import (
     AgentConfig,
     Message,
@@ -21,8 +22,17 @@ from src.tools.base import ToolRegistry
 
 @dataclass
 class AgentEvent:
-    """Agent Loop 产出的事件。"""
-    kind: str  # text_delta | tool_start | tool_result | assistant_done | error | turn_start
+    """Agent Loop 产出的事件。
+
+    kind 可能值：
+        - turn_start: Agent 循环新一轮开始
+        - text_delta: LLM 流式输出文本增量
+        - tool_start / tool_result: 工具调用开始/结束
+        - assistant_done: 一次完整的 assistant 回复结束
+        - auto_compact_start / auto_compact_done: 自动压缩开始/结束
+        - error: 错误
+    """
+    kind: str
     data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -70,6 +80,11 @@ class AgentLoop:
         """
         # 添加用户消息
         history.append(Message(role=Role.USER, content=user_input))
+
+        # ★ 自动压缩检查：用户消息入列后，进入对话循环前
+        # 这里检查能确保最新用户消息一定被保留（它在 history 末尾，不会被截断）
+        if self.config.auto_compact:
+            await self._maybe_auto_compact(history, on_event)
 
         for turn in range(self.config.max_turns):
             if on_event:
@@ -193,3 +208,92 @@ class AgentLoop:
             ))
 
         return result
+
+    # ------------------------------------------------------------------
+    # 自动压缩（auto compaction）
+    # ------------------------------------------------------------------
+
+    async def _maybe_auto_compact(
+        self,
+        history: list[Message],
+        on_event: EventSink | None,
+    ) -> None:
+        """检查并执行自动压缩。
+
+        触发条件（对齐原版 pi 的 shouldCompact）：
+            estimated_tokens(history + system_prompt) > context_window - reserve_tokens
+
+        压缩成功后 in-place 修改 history：clear + extend(new_messages)。
+        这样 self.session.messages 引用保持不变，TUI 能感知事件并重写 JSONL。
+
+        失败（消息太少 / LLM 报错）降级为 error 事件，不阻塞对话。
+        """
+        # 1. 估算当前上下文 tokens（消息 + system_prompt）
+        total = estimate_total_tokens(history)
+        if self.config.system_prompt:
+            # system_prompt 不是 Message，单独估算（chars/4 启发式）
+            total += (len(self.config.system_prompt) + 3) // 4
+
+        threshold = self.config.context_window - self.config.compact_reserve_tokens
+        if total <= threshold:
+            return  # 无需压缩
+
+        # 2. 消息太少不压缩（至少 4 条才有压缩意义）
+        if len(history) < 4:
+            return
+
+        # 3. 发出开始事件
+        if on_event:
+            await on_event(AgentEvent(
+                kind="auto_compact_start",
+                data={
+                    "tokens_before": total,
+                    "threshold": threshold,
+                    "message_count": len(history),
+                },
+            ))
+
+        # 4. 动态调整 keep_recent_tokens：
+        #    防御配置不合理（context_window - reserve_tokens < keep_recent_tokens），
+        #    否则 compact_history 会因为 total < keep_recent_tokens 抛 ValueError。
+        #    规则：实际使用的 keep_recent 不超过 total / 2（至少留一半给摘要）
+        effective_keep = min(
+            self.config.compact_keep_recent_tokens,
+            max(1, total // 2),
+        )
+
+        # 5. 调用 compact_history 生成新消息列表
+        try:
+            new_messages, stats = await compact_history(
+                messages=history,
+                client=self.client,
+                keep_recent_tokens=effective_keep,
+            )
+        except (ValueError, RuntimeError) as e:
+            # 业务异常（消息太少、LLM 失败）：降级为 error 事件，不阻塞对话
+            if on_event:
+                await on_event(AgentEvent(
+                    kind="error",
+                    data={"message": f"自动压缩失败（降级，继续对话）: {e}"},
+                ))
+            return
+
+        # 5. in-place 替换 history（保留 list 引用）
+        #    注意：必须先 snapshot new_messages，因为 compact_history 返回的
+        #    [summary_msg] + kept 里 kept 是 history 的切片引用，
+        #    history.clear() 不会影响新 list 本身，但要避免任何隐式引用问题
+        snapshot = list(new_messages)
+        history.clear()
+        history.extend(snapshot)
+
+        # 6. 发出完成事件
+        if on_event:
+            await on_event(AgentEvent(
+                kind="auto_compact_done",
+                data={
+                    "tokens_before": stats.tokens_before,
+                    "tokens_after": stats.tokens_after,
+                    "summarized_count": stats.summarized_count,
+                    "kept_count": stats.kept_count,
+                },
+            ))
